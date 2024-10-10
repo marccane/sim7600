@@ -26,10 +26,16 @@ const char apn[]  = "orangeworld"; // Change this to your Provider details
 const char gprsUser[] = "orange";
 const char gprsPass[] = "orange";
 
+// Server details
+const char server[]   = "vsh.pp.ua";
+const char resource[] = "/TinyGSM/logo.txt";
+const int  port       = 80;
+
 #include <TinyGsmClient.h>
 #include <SPI.h>
 // #include <SD.h>
 #include <Ticker.h>
+#include <ArduinoHttpClient.h>
 
 #ifdef DUMP_AT_COMMANDS  // if enabled it requires the streamDebugger lib
 #include <StreamDebugger.h>
@@ -38,6 +44,9 @@ TinyGsm modem(debugger);
 #else
 TinyGsm modem(SerialAT);
 #endif
+
+TinyGsmClient client(modem);
+HttpClient    http(client, server, port);
 
 #define uS_TO_S_FACTOR 1000000ULL  // Conversion factor for micro seconds to seconds
 #define TIME_TO_SLEEP  60          // Time ESP32 will go to sleep (in seconds)
@@ -96,11 +105,6 @@ void setup()
     if (!modem.restart()) {
         Serial.println("Failed to restart modem, attempting to continue without restarting");
     }
-
-
-
-
-
 }
 
 void loop()
@@ -239,6 +243,47 @@ void loop()
         Serial.println("Network connected");
     }
 
+/////////////////////////////////////////////
+      Serial.print(F("Performing HTTP GET request... "));
+      int err = http.get(resource);
+      if (err != 0) {
+        Serial.println(F("failed to connect"));
+        delay(10000);
+        return;
+      }
+
+      int status = http.responseStatusCode();
+      Serial.print(F("Response status code: "));
+      Serial.println(status);
+      if (!status) {
+        delay(10000);
+        return;
+      }
+
+      Serial.println(F("Response Headers:"));
+      while (http.headerAvailable()) {
+        String headerName  = http.readHeaderName();
+        String headerValue = http.readHeaderValue();
+        Serial.println("    " + headerName + " : " + headerValue);
+      }
+
+      int length = http.contentLength();
+      if (length >= 0) {
+        Serial.print(F("Content length is: "));
+        Serial.println(length);
+      }
+      if (http.isResponseChunked()) {
+        Serial.println(F("The response is chunked"));
+      }
+
+      String body = http.responseBody();
+      Serial.println(F("Response:"));
+      Serial.println(body);
+
+      Serial.print(F("Body length is: "));
+      Serial.println(body.length());
+
+/////////////////////////////////////////////
     Serial.println("\n---Starting GPRS TEST---\n");
     Serial.println("Connecting to: " + String(apn));
     if (!modem.gprsConnect(apn, gprsUser, gprsPass)) {
