@@ -1,21 +1,11 @@
-/*
-  FILE: AllFunctions.ino
-  AUTHOR: Koby Hale
-  PURPOSE: Test functionality
-*/
-
 #define TINY_GSM_MODEM_SIM7000
 #define TINY_GSM_RX_BUFFER 1024 // Set RX buffer to 1Kb
 #define SerialAT Serial1
-
-// See all AT commands, if wanted
-#define DUMP_AT_COMMANDS
 
 /*
    Tests enabled
 */
 #define TINY_GSM_TEST_GPRS    true
-#define TINY_GSM_TEST_GPS     true
 #define TINY_GSM_POWERDOWN    true
 
 // set GSM PIN, if any
@@ -28,16 +18,9 @@ const char gprsPass[] = "orange";
 
 #include <TinyGsmClient.h>
 #include <SPI.h>
-// #include <SD.h>
 #include <Ticker.h>
 
-#ifdef DUMP_AT_COMMANDS  // if enabled it requires the streamDebugger lib
-#include <StreamDebugger.h>
-StreamDebugger debugger(SerialAT, Serial);
-TinyGsm modem(debugger);
-#else
 TinyGsm modem(SerialAT);
-#endif
 
 #define uS_TO_S_FACTOR 1000000ULL  // Conversion factor for micro seconds to seconds
 #define TIME_TO_SLEEP  60          // Time ESP32 will go to sleep (in seconds)
@@ -75,15 +58,6 @@ void setup()
     delay(1000);
     digitalWrite(PWR_PIN, LOW);
 
-    // SPI.begin(SD_SCLK, SD_MISO, SD_MOSI, SD_CS);
-    // if (!SD.begin(SD_CS)) {
-    //     Serial.println("SDCard MOUNT FAIL");
-    // } else {
-    //     uint32_t cardSize = SD.cardSize() / (1024 * 1024);
-    //     String str = "SDCard Size: " + String(cardSize) + "MB";
-    //     Serial.println(str);
-    // }
-
     Serial.println("\nWait...");
 
     delay(1000);
@@ -96,16 +70,10 @@ void setup()
     if (!modem.restart()) {
         Serial.println("Failed to restart modem, attempting to continue without restarting");
     }
-
-
-
-
-
 }
 
 void loop()
 {
-
     // Restart takes quite some time
     // To skip it, call init() instead of restart()
     Serial.println("Initializing modem...");
@@ -128,13 +96,6 @@ void loop()
         DBG("Set GPS Power LOW Failed");
     }
 
-#if TINY_GSM_TEST_GPRS
-    // Unlock your SIM card with a PIN if needed
-    if ( GSM_PIN && modem.getSimStatus() != 3 ) {
-        modem.simUnlock(GSM_PIN);
-    }
-#endif
-
     modem.sendAT("+CFUN=0");
     if (modem.waitResponse(10000L) != 1) {
         DBG(" +CFUN=0  false ");
@@ -147,7 +108,6 @@ void loop()
       38 LTE only
       51 GSM and LTE only
     * * * */
-
     bool res = modem.setNetworkMode(2);
     if (!res) {
         DBG("setNetworkMode  false ");
@@ -286,41 +246,6 @@ void loop()
         Serial.println("GPRS disconnect: Failed.");
     }
 #endif
-
-#if TINY_GSM_TEST_GPS
-    Serial.println("\n---Starting GPS TEST---\n");
-    // Set Modem GPS Power Control Pin to HIGH ,turn on GPS power
-    // Only in version 20200415 is there a function to control GPS power
-    modem.sendAT("+CGPIO=0,48,1,1");
-    if (modem.waitResponse(10000L) != 1) {
-        DBG("Set GPS Power HIGH Failed");
-    }
-
-    modem.enableGPS();
-
-    float lat,  lon;
-    while (1) {
-        if (modem.getGPS(&lat, &lon)) {
-            Serial.printf("lat:%f lon:%f\n", lat, lon);
-            break;
-        } else {
-            Serial.print("getGPS ");
-            Serial.println(millis());
-        }
-        delay(2000);
-    }
-    modem.disableGPS();
-
-    // Set Modem GPS Power Control Pin to LOW ,turn off GPS power
-    // Only in version 20200415 is there a function to control GPS power
-    modem.sendAT("+CGPIO=0,48,1,0");
-    if (modem.waitResponse(10000L) != 1) {
-        DBG("Set GPS Power LOW Failed");
-    }
-
-    Serial.println("\n---End of GPRS TEST---\n");
-#endif
-
 
 #if TINY_GSM_POWERDOWN
     // Try to power-off (modem may decide to restart automatically)
