@@ -53,13 +53,13 @@ const char DEVICE_ID[] = SECRET_DEVICE_ID;   // also the MQTT username
 
 // ── Tunables (these become backend-configurable later) ──
 uint32_t reportIntervalS = 1800;   // production value; bench tests override below
-#define GPS_TIMEOUT_MS    60000UL  // max wait for a GPS fix
+#define GPS_TIMEOUT_MS    90000UL  // max wait for a GPS fix, from GPS start
 #define CYCLE_DEADLINE_MS 240000UL // hard cap on the active window (OTA excluded)
 #define OTA_TIMEOUT_MS    420000UL // whole download; ~2-3 min expected at 115200 baud
 #define OTA_MIN_BATT_V    3.60     // don't start a download on a weak cell
 #define WDT_TIMEOUT_MS    180000   // longest single blocking step is ~75 s (TCP connect)
 #define MODEM_OFF_SETTLE_MS 15000 // after CPOF, before a reboot that powers it on again
-#define FW_VERSION        "0.3.0"
+#define FW_VERSION        "0.3.3"
 
 // Bench test override: 90s cycles. MUST be removed before deployment.
 #define BENCH_TEST_INTERVAL_S 90
@@ -73,6 +73,9 @@ TinyGsm        modem(modemSerial);
 TinyGsmClient  gsmClient(modem, 0);   // MQTT
 TinyGsmClient  otaClient(modem, 1);   // HTTP (global: TinyGSM keeps a pointer to it)
 PubSubClient   mqtt(gsmClient);
+
+// GSV summary per constellation (declared up here for Arduino's prototypes)
+struct Sky { int view = -1, tracked = 0, maxSnr = 0; };
 
 uint32_t cycleStart;
 bool deadlineExceeded() { return millis() - cycleStart > CYCLE_DEADLINE_MS; }
@@ -250,10 +253,118 @@ void modemPowerOff() {
 }
 
 // ── GPS ──────────────────────────────────────────────────
-bool getGpsFix(float &lat, float &lon, float &acc, uint32_t timeoutMs) {
-  modem.enableGPS();
+// Raw reply of an AT command on one line (diagnostics).
+String atRaw(const char *cmd, uint32_t timeoutMs = 2000) {
+  String data;
+  modem.sendAT(cmd);
+  modem.waitResponse(timeoutMs, data);
+  data.replace("\r", "");
+  data.replace("\n", " ");
+  data.trim();
+  return data;
+}
+
+// gpsOneXTRA: satellite orbits downloaded over cellular (valid ~7 days), so
+// the receiver needn't decode them from the sky — that takes ≥30 s of clean
+// signal per satellite, which a cold start in a marginal spot rarely gets.
+// CGPSXE is stored by the modem and takes effect from its next power-up.
+// Needs the data connection, so it runs after GPRS and before GPS start.
+#define XTRA_EVERY_CYCLES 48     // re-download about daily at 30 min cycles
+RTC_DATA_ATTR uint32_t xtraAge = XTRA_EVERY_CYCLES;   // cycles since the last download
+
+void gpsXtra() {
+  String xe = atRaw("+CGPSXE?");
+  if (xe.indexOf("+CGPSXE: 1") < 0) {
+    logln("[GPS] XTRA off (" + xe + "), CGPSXE=1: " + atRaw("+CGPSXE=1") +
+          " — takes effect from the next modem power-up");
+    return;
+  }
+  if (xtraAge < XTRA_EVERY_CYCLES) { xtraAge++; return; }
+
+  wdtFeed();
   uint32_t t0 = millis();
-  while (millis() - t0 < timeoutMs) {
+  String data;
+  modem.sendAT(GF("+CGPSXD=0"));                    // OK now, +CGPSXD: <err> when done
+  int8_t r = modem.waitResponse(60000L, data, GF("+CGPSXD:"));
+  String code = r == 1 ? modemSerial.readStringUntil('\n') : "";
+  code.trim();
+  if (r == 1 && code == "0") xtraAge = 0;
+  logf("[GPS] XTRA download %s in %lus (modem clock %s)", r == 1 ? ("result " + code).c_str()
+       : r == 2 ? "ERROR" : "timeout", (unsigned long)(millis() - t0) / 1000,
+       atRaw("+CCLK?").c_str());              // XTRA needs a correct clock (network time)
+}
+
+// The active GNSS antenna is biased from modem pin 44 (VDD_EXT / VREG_AUX1,
+// LilyGO net VDD_3V through FB3), which AT+CVAUXS switches.
+uint32_t gpsStartMs;
+void gpsStart() {
+  String bias = atRaw("+CVAUXS=1");          // on by default; make sure
+  if (bias != "OK") logln("[GPS] antenna bias CVAUXS=1: " + bias);
+  gpsXtra();
+  gpsStartMs = millis();
+  if (!modem.enableGPS()) logln("[GPS] start FAILED: CGPS? " + atRaw("+CGPS?"));
+}
+
+// i-th comma-separated field of an NMEA sentence (checksum stripped).
+String nmeaField(const String &s, int idx) {
+  int start = 0;
+  for (int i = 0; i < idx; i++) {
+    start = s.indexOf(',', start) + 1;
+    if (start == 0) return "";
+  }
+  int end = s.indexOf(',', start);
+  if (end < 0) end = s.indexOf('*', start);
+  return s.substring(start, end < 0 ? s.length() : end);
+}
+
+void skyAdd(const String &s, Sky &gp, Sky &gl, int &used) {
+  if (s.startsWith("$GPGSV") || s.startsWith("$GLGSV")) {
+    Sky &k = s[2] == 'P' ? gp : gl;
+    if (nmeaField(s, 2).toInt() == 1) k = Sky();   // first sentence of a new group
+    k.view = nmeaField(s, 3).toInt();
+    for (int f = 7; f <= 19; f += 4) {             // SNR of each of ≤4 satellites
+      String snr = nmeaField(s, f);
+      if (snr.length()) { k.tracked++; k.maxSnr = max(k.maxSnr, (int)snr.toInt()); }
+    }
+  } else if (s.startsWith("$GPGGA") || s.startsWith("$GNGGA")) {
+    used = nmeaField(s, 7).toInt();
+  }
+}
+
+// What the receiver hears while searching: nothing in view = antenna/sky
+// problem; satellites with decent SNR (>30 dB) but no fix = slow cold start.
+String gpsSky() {
+  String ack;
+  modem.sendAT(GF("+CGPSINFOCFG=1,69"));          // NMEA every 1 s: GPGGA|GPGSV|GLGSV
+  if (modem.waitResponse(2000L, ack) != 1) {
+    ack.replace("\r\n", " "); ack.trim();
+    return "NMEA cfg failed: " + ack;
+  }
+  Sky gp, gl;
+  int used = -1;
+  String line;
+  uint32_t t0 = millis();
+  while (millis() - t0 < 2500) {
+    while (modemSerial.available()) {
+      char c = modemSerial.read();
+      if (c == '\n') { skyAdd(line, gp, gl, used); line = ""; }
+      else if (c != '\r' && line.length() < 120) line += c;
+    }
+    delay(5);
+  }
+  modem.sendAT(GF("+CGPSINFOCFG=0,69"));
+  modem.waitResponse(2000L);
+  delay(1200);                                     // drop sentences still in flight
+  while (modemSerial.available()) modemSerial.read();
+  char out[96];
+  snprintf(out, sizeof(out), "GP %d in view, %d heard, max %d dB | GL %d, %d, %d dB | used %d",
+           gp.view, gp.tracked, gp.maxSnr, gl.view, gl.tracked, gl.maxSnr, used);
+  return out;
+}
+
+bool getGpsFix(float &lat, float &lon, float &acc, uint32_t timeoutMs) {
+  uint32_t lastSky = millis();                     // first sky report after 15 s without fix
+  while (millis() - gpsStartMs < timeoutMs) {
     wdtFeed();
     if (deadlineExceeded()) break;
     float speed, alt, accuracy;
@@ -261,10 +372,16 @@ bool getGpsFix(float &lat, float &lon, float &acc, uint32_t timeoutMs) {
     if (modem.getGPS(&lat, &lon, &speed, &alt, &vsat, &usat, &accuracy,
                      &year, &month, &day, &hour, &min, &sec)) {
       acc = accuracy;
+      logf("[GPS] fix after %lus, pdop %.1f", (unsigned long)(millis() - gpsStartMs) / 1000,
+           accuracy);                              // (TinyGSM leaves vsat/usat at 0 here)
       modem.disableGPS();
       return true;
     }
-    delay(2000);
+    if (millis() - lastSky >= 15000) {
+      lastSky = millis();
+      logf("[GPS] %3lus: %s", (unsigned long)(millis() - gpsStartMs) / 1000, gpsSky().c_str());
+    }
+    delay(1000);
   }
   modem.disableGPS();
   return false;
@@ -479,6 +596,7 @@ void setup() {
         logln("[NET] GPRS ok, IP: " + modem.localIP().toString());
 
         if (!skipGps && !deadlineExceeded()) {
+          gpsStart();
           logln("[GPS] waiting for fix...");
           gpsOk = getGpsFix(lat, lon, acc, GPS_TIMEOUT_MS);
           logln(gpsOk
