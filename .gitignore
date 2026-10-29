@@ -1,2 +1,6 @@
 tracker.log
 __pycache__/
+tools/secrets.env
+secrets.h
+build_id.h
+build/

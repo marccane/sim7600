@@ -1,11 +1,23 @@
 #!/usr/bin/env python3
 # Minimal MQTT 3.1.1 subscriber (no paho) → appends to tracker.log
+# Config via env (or tools/secrets.env when run from the repo):
+#   MQTT_HOST, MQTT_PORT, MQTT_USER, MQTT_PASS, MQTT_TOPIC, LOG_FILE
 import socket, struct, time, datetime, os
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+try:  # repo-local secrets; env vars win
+    for l in open(os.path.join(HERE, 'secrets.env')):
+        k, _, v = l.strip().partition('=')
+        if k and not k.startswith('#'):
+            os.environ.setdefault(k, v)
+except FileNotFoundError:
+    pass
 
 HOST = os.environ.get('MQTT_HOST', 'broker.emqx.io')
 PORT = int(os.environ.get('MQTT_PORT', '1883'))
 TOPIC = os.environ.get('MQTT_TOPIC', 'devices/bike-01/#')
-LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'tracker.log')
+USER, PASS = os.environ.get('MQTT_USER'), os.environ.get('MQTT_PASS', '')
+LOG = os.environ.get('LOG_FILE', os.path.join(HERE, '..', 'tracker.log'))
 
 def enc_str(s):
     b = s.encode(); return struct.pack('!H', len(b)) + b
@@ -41,8 +53,14 @@ with open(LOG, 'a', buffering=1) as f:
         try:
             s = socket.create_connection((HOST, PORT), timeout=15)
             cid = f'pc-listen-{os.getpid()}'
-            s.sendall(packet(0x10, enc_str('MQTT') + b'\x04\x02' + struct.pack('!H', 60) + enc_str(cid)))
-            read_packet(s)
+            flags, creds = 0x02, b''                         # clean session
+            if USER:
+                flags |= 0xC0; creds = enc_str(USER) + enc_str(PASS)
+            s.sendall(packet(0x10, enc_str('MQTT') + b'\x04' + bytes([flags])
+                             + struct.pack('!H', 60) + enc_str(cid) + creds))
+            _, ack = read_packet(s)
+            if ack[1] != 0:
+                raise ConnectionError(f'CONNACK refused, code {ack[1]}')
             s.sendall(packet(0x82, struct.pack('!H', 1) + enc_str(TOPIC) + b'\x00'))
             read_packet(s)
             out(f, f'subscribed to {TOPIC} @ {HOST}')
