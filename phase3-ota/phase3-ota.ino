@@ -13,14 +13,22 @@
 //     roll back to the previous build, which refuses that build after two
 //     failures (no download loop).
 //
+//   • Remote config: the retained devices/<id>/config document (set with
+//     tools/set_config.py) is read on every wake, validated, kept in NVS and
+//     acknowledged on devices/<id>/ack.
+//   • Emergency mode (config mode=emergency): stay online with GPS running
+//     and report every emergency_interval_s until the mode is cleared.
+//
 // Build/publish with tools/deploy_ota.sh (partition scheme min_spiffs: two
-// 1.9 MB OTA slots). Libraries: TinyGSM, PubSubClient, ArduinoHttpClient
+// 1.9 MB OTA slots). Libraries: TinyGSM, PubSubClient, ArduinoHttpClient,
+// ArduinoJson
 
 #define TINY_GSM_MODEM_SIM7600
 #define TINY_GSM_RX_BUFFER 1024   // default 64 B makes downloads crawl
 #include <TinyGsmClient.h>
 #include <PubSubClient.h>
 #include <ArduinoHttpClient.h>
+#include <ArduinoJson.h>
 #include <Update.h>
 #include <Preferences.h>
 #include <esp_ota_ops.h>
@@ -51,18 +59,22 @@ const char PASS[] = "orange";
 
 const char DEVICE_ID[] = SECRET_DEVICE_ID;   // also the MQTT username
 
-// ── Tunables (these become backend-configurable later) ──
-uint32_t reportIntervalS = 1800;   // production value; bench tests override below
-#define GPS_TIMEOUT_MS    90000UL  // max wait for a GPS fix, from GPS start
+// ── Tunables ─────────────────────────────────────────────
+// Remote-configurable ones live in `cfg` (defaults in struct Config below).
 #define CYCLE_DEADLINE_MS 240000UL // hard cap on the active window (OTA excluded)
+#define CONFIG_WAIT_MS    2000     // for the retained config after subscribing
+#define EMERGENCY_MIN_BATT_V         3.50     // below (twice in a row): leave the online loop...
+#define EMERGENCY_LOWBATT_INTERVAL_S 300      // ...and report on wake cycles this long instead
+#define EMERGENCY_LINK_FAIL_MS       180000UL // no publish for this long: power-cycle the modem
+#define EMERGENCY_RETRY_S            30       // sleep before that retry
 #define OTA_TIMEOUT_MS    420000UL // whole download; ~2-3 min expected at 115200 baud
 #define OTA_MIN_BATT_V    3.60     // don't start a download on a weak cell
 #define WDT_TIMEOUT_MS    180000   // longest single blocking step is ~75 s (TCP connect)
 #define MODEM_OFF_SETTLE_MS 15000 // after CPOF, before a reboot that powers it on again
-#define FW_VERSION        "0.4.0"
+#define FW_VERSION        "0.5.0"
 
 // Bench-only switches — keep both commented out in a deployed build.
-// 90 s cycles instead of reportIntervalS:
+// 90 s cycles regardless of the configured report_interval_s:
 // #define BENCH_TEST_INTERVAL_S 90
 // Never deep sleep: idle, then restart (board stays awake, USB serial usable):
 // #define DEBUG_NO_SLEEP
@@ -75,6 +87,16 @@ PubSubClient   mqtt(gsmClient);
 
 // GSV summary per constellation (declared up here for Arduino's prototypes)
 struct Sky { int view = -1, tracked = 0, maxSnr = 0; };
+
+// Remote config: defaults until a retained devices/<id>/config is applied.
+struct Config {
+  uint32_t v = 0;                      // version of the applied config document
+  uint32_t reportIntervalS = 1800;     // normal wake cadence
+  uint32_t gpsTimeoutS = 90;           // max wait for a fix, from GPS start
+  bool     emergency = false;          // mode: "normal" / "emergency"
+  uint32_t emergencyIntervalS = 60;    // report cadence while in emergency mode
+};
+Config cfg;
 
 uint32_t cycleStart;
 bool deadlineExceeded() { return millis() - cycleStart > CYCLE_DEADLINE_MS; }
@@ -126,10 +148,12 @@ void logf(const char *fmt, ...) {
   emit(buf, n);
 }
 
+String topicFor(const char *leaf) { return String("devices/") + DEVICE_ID + "/" + leaf; }
+
 // Publish the RTC log in ≤LOG_CHUNK pieces split at line ends; what was sent
 // is dropped from the buffer. Must not log itself (it would append to it).
 bool publishLog() {
-  String topic = String("devices/") + DEVICE_ID + "/log";
+  String topic = topicFor("log");
   size_t off = 0;
   bool ok = true;
   while (off < rtcLog.len) {
@@ -361,18 +385,22 @@ String gpsSky() {
   return out;
 }
 
+// One poll of the running receiver. acc is PDOP (TinyGSM's "accuracy"; it
+// also leaves vsat/usat at 0 on the SIM7600).
+bool gpsPoll(float &lat, float &lon, float &acc) {
+  float speed, alt;
+  int vsat, usat, year, month, day, hour, min, sec;
+  return modem.getGPS(&lat, &lon, &speed, &alt, &vsat, &usat, &acc,
+                      &year, &month, &day, &hour, &min, &sec);
+}
+
 bool getGpsFix(float &lat, float &lon, float &acc, uint32_t timeoutMs) {
   uint32_t lastSky = millis();                     // first sky report after 15 s without fix
   while (millis() - gpsStartMs < timeoutMs) {
     wdtFeed();
     if (deadlineExceeded()) break;
-    float speed, alt, accuracy;
-    int vsat, usat, year, month, day, hour, min, sec;
-    if (modem.getGPS(&lat, &lon, &speed, &alt, &vsat, &usat, &accuracy,
-                     &year, &month, &day, &hour, &min, &sec)) {
-      acc = accuracy;
-      logf("[GPS] fix after %lus, pdop %.1f", (unsigned long)(millis() - gpsStartMs) / 1000,
-           accuracy);                              // (TinyGSM leaves vsat/usat at 0 here)
+    if (gpsPoll(lat, lon, acc)) {
+      logf("[GPS] fix after %lus, pdop %.1f", (unsigned long)(millis() - gpsStartMs) / 1000, acc);
       modem.disableGPS();
       return true;
     }
@@ -526,6 +554,216 @@ bool otaCheck() {
   return true;
 }
 
+// ── Remote config ────────────────────────────────────────
+// devices/<id>/config holds one retained JSON document, e.g.
+//   {"v":3,"report_interval_s":1800,"gps_timeout_s":90,"mode":"normal","emergency_interval_s":60}
+// "v" must change for a document to be applied; absent keys keep their value.
+// A document with any invalid value is rejected as a whole.
+Preferences cfgPrefs;
+String pendingConfig;                  // copied out of the MQTT callback...
+bool   gotConfig = false;              // ...and applied outside it (publish reuses the buffer)
+RTC_DATA_ATTR uint32_t cfgRejectedV = 0;   // ack a rejected version only once
+
+void cfgLoad() {
+  cfgPrefs.begin("cfg", false);
+  cfg.v                  = cfgPrefs.getUInt("v", cfg.v);
+  cfg.reportIntervalS    = cfgPrefs.getUInt("report", cfg.reportIntervalS);
+  cfg.gpsTimeoutS        = cfgPrefs.getUInt("gps", cfg.gpsTimeoutS);
+  cfg.emergency          = cfgPrefs.getBool("emg", cfg.emergency);
+  cfg.emergencyIntervalS = cfgPrefs.getUInt("emgint", cfg.emergencyIntervalS);
+  logf("[CFG] v%u: report %us, gps %us, mode %s, emergency every %us", cfg.v,
+       cfg.reportIntervalS, cfg.gpsTimeoutS, cfg.emergency ? "emergency" : "normal",
+       cfg.emergencyIntervalS);
+}
+
+void cfgSave() {
+  cfgPrefs.putUInt("v", cfg.v);
+  cfgPrefs.putUInt("report", cfg.reportIntervalS);
+  cfgPrefs.putUInt("gps", cfg.gpsTimeoutS);
+  cfgPrefs.putBool("emg", cfg.emergency);
+  cfgPrefs.putUInt("emgint", cfg.emergencyIntervalS);
+}
+
+void applyConfig(const String &json) {
+  if (json.length() == 0) return;      // retained config deleted: keep what we have
+  JsonDocument doc;
+  uint32_t v = 0;
+  String err;
+  if (deserializeJson(doc, json)) {
+    err = "invalid JSON";
+  } else {
+    v = doc["v"] | 0u;
+    if (v == cfg.v || v == cfgRejectedV) return;   // already applied / already refused
+  }
+
+  Config n = cfg;
+  auto num = [&](const char *key, uint32_t &dst, uint32_t lo, uint32_t hi) {
+    JsonVariant x = doc[key];
+    if (x.isNull() || err.length()) return;
+    if (!x.is<uint32_t>() || x.as<uint32_t>() < lo || x.as<uint32_t>() > hi)
+      err = String(key) + " must be " + lo + ".." + hi;
+    else
+      dst = x.as<uint32_t>();
+  };
+  if (!err.length()) {
+    num("report_interval_s",    n.reportIntervalS,    60, 86400);
+    num("gps_timeout_s",        n.gpsTimeoutS,        10, 180);
+    num("emergency_interval_s", n.emergencyIntervalS, 10, 3600);
+    JsonVariant m = doc["mode"];
+    if (!m.isNull() && !err.length()) {
+      if (m == "normal")         n.emergency = false;
+      else if (m == "emergency") n.emergency = true;
+      else                       err = "mode must be normal or emergency";
+    }
+  }
+
+  JsonDocument ack;
+  ack["v"] = v;
+  ack["ok"] = !err.length();
+  if (err.length()) {
+    cfgRejectedV = v;
+    ack["error"] = err;
+    logf("[CFG] v%u rejected: %s", v, err.c_str());
+  } else {
+    n.v = v;
+    cfg = n;
+    cfgSave();
+    ack["report_interval_s"] = cfg.reportIntervalS;
+    ack["gps_timeout_s"] = cfg.gpsTimeoutS;
+    ack["mode"] = cfg.emergency ? "emergency" : "normal";
+    ack["emergency_interval_s"] = cfg.emergencyIntervalS;
+    logf("[CFG] applied v%u: report %us, gps %us, mode %s, emergency every %us", cfg.v,
+         cfg.reportIntervalS, cfg.gpsTimeoutS, cfg.emergency ? "emergency" : "normal",
+         cfg.emergencyIntervalS);
+  }
+  String out;
+  serializeJson(ack, out);
+  mqtt.publish(topicFor("ack").c_str(), out.c_str());
+}
+
+// ── MQTT ─────────────────────────────────────────────────
+void onMqtt(char *topic, uint8_t *payload, unsigned int len) {
+  if (topicFor("config") != topic) return;
+  pendingConfig = "";
+  pendingConfig.reserve(len);
+  for (unsigned int i = 0; i < len; i++) pendingConfig += (char)payload[i];
+  gotConfig = true;
+}
+
+// Connect and subscribe to the config (the retained document follows the SUBACK).
+bool mqttConnect() {
+  mqtt.setServer(SECRET_MQTT_HOST, SECRET_MQTT_PORT);
+  mqtt.setSocketTimeout(15);
+  mqtt.setBufferSize(LOG_CHUNK + 128);
+  mqtt.setCallback(onMqtt);
+  if (!mqtt.connect(DEVICE_ID, DEVICE_ID, SECRET_MQTT_PASS)) return false;
+  if (!mqtt.subscribe(topicFor("config").c_str())) logln("[CFG] subscribe failed");
+  return true;
+}
+
+// Apply the retained config if it arrives within CONFIG_WAIT_MS.
+void fetchConfig() {
+  uint32_t t0 = millis();
+  while (!gotConfig && millis() - t0 < CONFIG_WAIT_MS && mqtt.connected()) {
+    mqtt.loop();
+    delay(10);
+  }
+  if (gotConfig) { gotConfig = false; applyConfig(pendingConfig); }
+}
+
+String telemetry(bool gpsOk, float lat, float lon, float acc, float battV, float solarV,
+                 const char *reason, bool lastGasp) {
+  return String("{\"lat\":")    + (gpsOk ? String(lat, 6) : "null") +
+         ",\"lon\":"            + (gpsOk ? String(lon, 6) : "null") +
+         ",\"acc_m\":"          + (gpsOk ? String(acc, 0) : "null") +
+         ",\"batt_v\":"         + String(battV, 2) +
+         ",\"batt_pct\":"       + String(battPercent(battV)) +
+         ",\"solar_v\":"        + String(solarV, 2) +
+         ",\"signal\":"         + String(modem.getSignalQuality()) +
+         ",\"mode\":\""         + (cfg.emergency ? "emergency" : "normal") + "\"" +
+         ",\"reason\":\""       + reason + "\"" +
+         ",\"last_gasp\":"      + (lastGasp ? "true" : "false") +
+         ",\"cfg_v\":"          + String(cfg.v) +
+         ",\"fw\":\""           + FW_VERSION + "\"" +
+         ",\"build\":\""        + FW_BUILD + "\"" +
+         ",\"boot\":\""         + resetReason() + "\"" +
+         (otaNote.length() ? ",\"ota\":\"" + otaNote + "\"" : "") + "}";
+}
+
+// ── Emergency mode ───────────────────────────────────────
+// Stay online with the receiver running (fixes in ~1 s) and report every
+// emergencyIntervalS. Config changes arrive live, so clearing the mode ends
+// the loop within seconds. Returns how long to sleep afterwards.
+float battAverage() {
+  uint32_t mv = 0;
+  for (int i = 0; i < 8; i++) mv += analogReadMilliVolts(BAT_ADC_PIN);
+  return mv / 8 * 2.0 / 1000.0;          // 100K/100K divider
+}
+
+uint32_t emergencyLoop(float solarV) {
+  logf("[EMG] emergency mode: reporting every %us", cfg.emergencyIntervalS);
+  modem.enableGPS();
+  uint32_t lastReport = millis();        // the cycle's own report just went out
+  uint32_t downSince = 0;                // 0 = MQTT connected
+  uint32_t reports = 0;
+  int lowBatt = 0;
+  String topic = topicFor("telemetry");
+
+  while (true) {
+    wdtFeed();
+    mqtt.loop();
+    if (gotConfig) { gotConfig = false; applyConfig(pendingConfig); }
+    if (!cfg.emergency) {
+      logf("[EMG] cleared after %u reports", reports);
+      modem.disableGPS();
+      return cfg.reportIntervalS;
+    }
+    if (!mqtt.connected()) {
+      if (!downSince) {
+        downSince = millis() | 1;
+        logln("[EMG] MQTT connection lost, reconnecting");
+      }
+      if (millis() - downSince > EMERGENCY_LINK_FAIL_MS) {
+        logln("[EMG] still offline, power-cycling the modem");
+        modem.disableGPS();
+        return EMERGENCY_RETRY_S;
+      }
+      if (!modem.isGprsConnected()) {
+        wdtFeed();
+        modem.gprsConnect(APN, USER, PASS);
+      }
+      wdtFeed();
+      if (!mqttConnect()) { delay(5000); continue; }
+      logf("[EMG] reconnected after %lus", (unsigned long)(millis() - downSince) / 1000);
+      downSince = 0;
+    }
+
+    if (millis() - lastReport >= cfg.emergencyIntervalS * 1000UL) {
+      lastReport = millis();
+      float battV = battAverage();
+      bool onUsb = battV < 1.0;
+      lowBatt = (!onUsb && battV < EMERGENCY_MIN_BATT_V) ? lowBatt + 1 : 0;
+      if (lowBatt >= 2) {
+        logf("[EMG] battery %.2f V: falling back to %us wake cycles", battV,
+             EMERGENCY_LOWBATT_INTERVAL_S);
+        modem.disableGPS();
+        return EMERGENCY_LOWBATT_INTERVAL_S;
+      }
+      float lat = 0, lon = 0, acc = 0;
+      bool fix = gpsPoll(lat, lon, acc);
+      String payload = telemetry(fix, lat, lon, acc, battV, solarV, "emergency", false);
+      if (mqtt.publish(topic.c_str(), payload.c_str())) {
+        if (reports++ % 10 == 0)         // keep the log light: every 10th report
+          logf("[EMG] report #%u: fix=%d batt=%.2f V", reports, fix, battV);
+        publishLog();
+      } else {
+        logln("[EMG] publish failed");
+      }
+    }
+    delay(50);
+  }
+}
+
 // ── One full cycle ───────────────────────────────────────
 void setup() {
   Serial.begin(115200);
@@ -543,9 +781,7 @@ void setup() {
        (int)esp_sleep_get_wakeup_cause(), FW_VERSION, FW_BUILD,
        esp_ota_get_running_partition()->label);
   otaBootCheck();
-#ifdef BENCH_TEST_INTERVAL_S
-  reportIntervalS = BENCH_TEST_INTERVAL_S;   // bench override
-#endif
+  cfgLoad();
 
   // Battery BEFORE powering the modem (resting voltage, no TX sag)
   float battV = readVolts(BAT_ADC_PIN);
@@ -553,8 +789,7 @@ void setup() {
   logf("[BAT] %.2f V (%d%%)  solar %.2f V", battV, battPercent(battV), solarV);
 
   const char *reason = "timer";
-  const char *mode   = "normal";
-  uint32_t sleepS = reportIntervalS;
+  uint32_t sleepS = 0;                 // 0: decided at the end, from the (maybe updated) config
   bool skipGps = false;
   bool lastGasp = false;
 
@@ -597,7 +832,7 @@ void setup() {
         if (!skipGps && !deadlineExceeded()) {
           gpsStart();
           logln("[GPS] waiting for fix...");
-          gpsOk = getGpsFix(lat, lon, acc, GPS_TIMEOUT_MS);
+          gpsOk = getGpsFix(lat, lon, acc, cfg.gpsTimeoutS * 1000UL);
           logln(gpsOk
             ? "[GPS] fix: " + String(lat, 6) + ", " + String(lon, 6) + " (acc " + String(acc, 0) + "m)"
             : "[GPS] no fix (timeout)");
@@ -605,30 +840,19 @@ void setup() {
 
         wdtFeed();
         if (!deadlineExceeded()) {
-          mqtt.setServer(SECRET_MQTT_HOST, SECRET_MQTT_PORT);
-          mqtt.setSocketTimeout(15);
-          mqtt.setBufferSize(LOG_CHUNK + 128);
-          if (mqtt.connect(DEVICE_ID, DEVICE_ID, SECRET_MQTT_PASS)) {
-            String payload =
-              String("{\"lat\":")    + (gpsOk ? String(lat, 6) : "null") +
-              ",\"lon\":"            + (gpsOk ? String(lon, 6) : "null") +
-              ",\"acc_m\":"          + (gpsOk ? String(acc, 0) : "null") +
-              ",\"batt_v\":"         + String(battV, 2) +
-              ",\"batt_pct\":"       + String(battPercent(battV)) +
-              ",\"solar_v\":"        + String(solarV, 2) +
-              ",\"signal\":"         + String(modem.getSignalQuality()) +
-              ",\"mode\":\""         + String(mode) + "\"" +
-              ",\"reason\":\""       + String(reason) + "\"" +
-              ",\"last_gasp\":"      + (lastGasp ? "true" : "false") +
-              ",\"fw\":\""           + FW_VERSION + "\"" +
-              ",\"build\":\""        + FW_BUILD + "\"" +
-              ",\"boot\":\""         + resetReason() + "\"" +
-              (otaNote.length() ? ",\"ota\":\"" + otaNote + "\"" : "") + "}";
-            String topic = String("devices/") + DEVICE_ID + "/telemetry";
-            published = mqtt.publish(topic.c_str(), payload.c_str());
+          if (mqttConnect()) {
+            String payload = telemetry(gpsOk, lat, lon, acc, battV, solarV, reason, lastGasp);
+            published = mqtt.publish(topicFor("telemetry").c_str(), payload.c_str());
             logln(published ? "[MQTT] published: " + payload
                             : "[MQTT] publish failed");
             if (published) otaConfirm();
+            fetchConfig();
+            if (cfg.emergency && !lastGasp) {
+              if (onUsb || battV >= EMERGENCY_MIN_BATT_V)
+                sleepS = emergencyLoop(solarV);
+              else
+                logf("[EMG] battery %.2f V: wake cycles instead of staying online", battV);
+            }
             publishLog();
             mqtt.disconnect();
           } else {
@@ -637,8 +861,9 @@ void setup() {
         }
 
         // Self-update only from a deployed build, after a successful publish
-        // (so a broken network path can't strand us mid-download).
-        if (published && strcmp(FW_BUILD, "dev") != 0) {
+        // (so a broken network path can't strand us mid-download), and never
+        // in emergency mode.
+        if (published && !cfg.emergency && strcmp(FW_BUILD, "dev") != 0) {
           if (onUsb || battV >= OTA_MIN_BATT_V) {
             wdtFeed();
             otaReady = otaCheck();
@@ -656,8 +881,8 @@ void setup() {
     logln("[PWR] modem did not power on!");
   }
 
-  logf("[CYCLE] net=%d gps=%d pub=%d ota=%d %lus", networkOk, gpsOk, published,
-       otaReady, (unsigned long)(millis() - cycleStart) / 1000);
+  logf("[CYCLE] net=%d gps=%d pub=%d ota=%d emg=%d %lus", networkOk, gpsOk, published,
+       otaReady, cfg.emergency, (unsigned long)(millis() - cycleStart) / 1000);
   modemPowerOff();
 
   // Immediate reboots: the modem stops answering AT before it has finished
@@ -671,6 +896,13 @@ void setup() {
     Serial.flush(); delay(MODEM_OFF_SETTLE_MS);
     esp_restart();
   }
+
+  if (sleepS == 0)                     // emergency without the online loop: wake often
+    sleepS = cfg.emergency ? min(cfg.reportIntervalS, (uint32_t)EMERGENCY_LOWBATT_INTERVAL_S)
+                           : cfg.reportIntervalS;
+#ifdef BENCH_TEST_INTERVAL_S
+  if (!lastGasp) sleepS = min(sleepS, (uint32_t)BENCH_TEST_INTERVAL_S);   // bench cap
+#endif
 
   digitalWrite(LED_PIN, published ? HIGH : LOW);
   delay(published ? 200 : 1200);

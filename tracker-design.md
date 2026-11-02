@@ -174,18 +174,28 @@ devices/{id}/ota          ← server → device (firmware chunks)
 ## 12. Development roadmap
 
 1. **Phase 1 — data path** ✅ **DONE** (tested 2026-10-12): modem init → network (signal 25) → GPRS → GPS fix (2 m accuracy) → MQTT publish to `devices/bike-01/telemetry` via `test.mosquitto.org`. Sketch: `phase1/phase1.ino`. Flash via `/dev/ttyACM0` (CH343 USB-UART — the ESP32 USB-C port, not the modem's).
-2. **Phase 2 — sleep/wake skeleton**: deep-sleep loop with fixed timer; measure real current draw.
-3. **Phase 3 — offline queue + config + commands**: flash storage, config persistence, command handler.
-4. **Phase 4 — backend + dashboard**: Mosquitto + FastAPI + SQLite + map + alerts.
-5. **Phase 5 — OTA + security**: TLS, per-device certs, signed OTA with rollback.
-6. **Phase 6 — polish**: geofence, battery alerts, diagnostics, long-duration test. (Motion detection if/when decided.)
+2. **Phase 2 — sleep/wake skeleton** ✅ **DONE** (2026-11-02): deep sleep with a 30 min RTC timer verified on the device (`phase3-ota/`, branch `production`, v0.4.0). Still open: measure real current draw.
+
+Done ahead of plan (2026-10-29 … 11-02, see `architecture-and-ota.md`): pull-based OTA over cellular with A/B rollback, probation and blacklist; task watchdog; remote logs (RTC ring buffer → `devices/{id}/log`); own Mosquitto on the VPS with per-device password + ACL; GPS with XTRA assistance and remote sky diagnostics.
+
+Remaining work, in order (decided 2026-11-02):
+
+3. **Milestone 1 — command channel + remote config** ✅ **DONE** (2026-11-02, v0.5.0, `tools/set_config.py`; apply, reject and live update verified on the device): retained `devices/{id}/config` read on every wake, validated, persisted in NVS, acknowledged on `devices/{id}/ack`; a VPS-side tool to set it. Also lets the bench switch between 30 min and fast cycles without an OTA.
+4. **Milestone 2 — emergency mode** ✅ **DONE** (2026-11-02: 30 s reports, cleared live within a second): on `mode: emergency` the modem, GPS and MQTT stay up and report every `emergency_interval_s`; falls back to slower reports at a battery floor; exits as soon as the config is cleared. Latency to start = up to one `report_interval_s` (modem is off while asleep).
+5. **Milestone 3 — data quality + offline queue**: `ts` (GPS / network time), HDOP + satellites instead of PDOP in `acc_m`, offline fix queue in flash with `queued`, cell-tower ID for server-side fallback, modem-echo fix.
+6. **Milestone 4 — backend v1**: FastAPI + SQLite ingest, map with track, buttons (Emergency / Locate / Config), ntfy alerts (missed reports, low battery, geofence).
+7. **Milestone 5 — security**: MQTT over TLS, HTTPS or signed OTA images, per-device credentials provisioned into NVS.
+8. **Milestone 6 — field readiness**: current measurement, solar charging, long-duration run; motion sensor if/when added.
 
 ## 13. Decisions log
 
 | Decision | Choice |
 |---|---|
 | Battery target | ~1 month |
-| Motion detection | Decide later (firmware supports it, build timer-only first) |
+| Motion detection | Decide later (firmware supports it, build timer-only first); re-confirmed 2026-11-02 |
+| Next priority (2026-11-02) | Command channel + emergency mode, before backend and security |
+| Report cadence during testing | 5 min (`report_interval_s=300` via remote config) until a motion sensor exists; no solar, cells swapped by hand |
+| Dev device | The one board stays on the bench: `main` builds OTA to it, branch `production` records the last deployed state. Stable/dev OTA channels once a second board exists |
 | Backend | Python + FastAPI + Mosquitto + SQLite |
 | Dashboard | Web + push alerts (ntfy/Telegram) |
 | Mounting | Sealed/hidden + solar |

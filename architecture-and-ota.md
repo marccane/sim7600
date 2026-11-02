@@ -28,6 +28,7 @@ live only in `tools/secrets.env`, which is gitignored.
                                                          │ Developer PC                         │
                                                          │  tools/deploy_ota.sh  (build+publish)│
                                                          │  tools/mqtt_listen.py (watch device) │
+                                                         │  tools/set_config.py  (remote config)│
                                                          └──────────────────────────────────────┘
 ```
 
@@ -35,7 +36,8 @@ Design choices:
 
 - **The device always initiates.** It sleeps most of the time and can't be reached
   while asleep, so instead of having updates *pushed* to it, it *pulls* them: after
-  each report it asks the server whether there's a new build.
+  each report it asks the server whether there's a new build. Config works the same
+  way: a retained MQTT message waits on the broker until the device wakes.
 - **MQTT for data, HTTP for images.** Telemetry and logs are small messages, which
   suits MQTT. Firmware images are static files that are easy to serve and stream
   over HTTP.
@@ -66,10 +68,13 @@ boot ─► restore RTC log, arm watchdog, check OTA state (probation? rolled ba
      ─► read battery (before the modem draws current)
      ─► modem power-on (1 s PWRKEY pulse, up to 2 tries, ~20 s to AT-ready)
      ─► network registration ─► data connection ─► GPS fix (bounded)
-     ─► MQTT: publish telemetry ─► confirm new build (if on probation) ─► publish logs
-     ─► OTA check: fetch manifest, install new build if needed
+     ─► MQTT: publish telemetry ─► confirm new build (if on probation)
+     ─► read the retained config, apply it if its version is new
+     ─► [emergency mode: stay online, report every emergency_interval_s until cleared]
+     ─► publish logs
+     ─► OTA check (not in emergency mode): fetch manifest, install new build if needed
      ─► modem power-off (AT+CPOF, PWRKEY fallback)
-     ─► reboot into new build  |  deep sleep until next report
+     ─► reboot into new build  |  deep sleep for report_interval_s
 ```
 
 Safety rails:
@@ -105,10 +110,60 @@ That lets a new build upload the old build's last lines, and vice versa.
 |---|---|---|
 | `devices/<id>/telemetry` | device → server | JSON: position, battery, signal, `fw`, `build`, `boot` (reset reason), `ota` (last OTA event) |
 | `devices/<id>/log` | device → server | plain-text log chunks |
+| `devices/<id>/config` | server → device | retained JSON config document (see 2.5) |
+| `devices/<id>/ack` | device → server | JSON: the config version applied, or why it was rejected |
 
 The device uses its id as both MQTT client id and username. The broker's ACL
 (`pattern readwrite devices/%u/#`) confines each device to its own subtree.
-A separate backend/bench user may read `devices/#`.
+A separate backend/bench user may read and write `devices/#` (it publishes the
+config).
+
+### 2.5 Remote config and emergency mode
+
+The config is one retained JSON document on `devices/<id>/config`:
+
+```json
+{"v": 3, "report_interval_s": 1800, "gps_timeout_s": 90, "mode": "normal", "emergency_interval_s": 60}
+```
+
+| Key | Range | Meaning |
+|---|---|---|
+| `v` | any new value | version; a document is applied only when `v` differs from the applied one |
+| `report_interval_s` | 60–86400 | deep-sleep time between normal reports |
+| `gps_timeout_s` | 10–180 | max wait for a fix, from GPS start |
+| `mode` | `normal` / `emergency` | see below |
+| `emergency_interval_s` | 10–3600 | report cadence in emergency mode |
+
+- The device subscribes right after connecting. The broker delivers the retained
+  document immediately, so the device waits at most 2 s for it.
+- Absent keys keep their current value. A document with any out-of-range value is
+  rejected as a whole. Either way the device answers once on `devices/<id>/ack`
+  (`{"v":3,"ok":true,...}` or `{"v":4,"ok":false,"error":"..."}`), and telemetry
+  carries `cfg_v`.
+- The applied config is kept in NVS, so it survives reboots, power loss and OTA
+  updates. Without a retained document the device keeps what it has (defaults on
+  first boot).
+
+```bash
+tools/set_config.py                                     # show the current document
+tools/set_config.py --wait report_interval_s=90          # merge, bump v, publish, wait for the ack
+tools/set_config.py --wait mode=emergency emergency_interval_s=30
+tools/set_config.py --wait mode=normal
+```
+
+**Emergency mode** is for a stolen device. Instead of powering the modem off, the
+device stays online with the GPS receiver running and publishes telemetry
+(`"reason":"emergency"`) every `emergency_interval_s`.
+
+- It only starts at the device's next wake, so it can take up to one
+  `report_interval_s` to begin.
+- Once it's running, config changes arrive live: `mode=normal` ends the loop within
+  seconds, and the device goes back to sleeping for `report_interval_s`.
+- The cost is roughly 100 mA, about half a day on a 1500 mAh cell. At two
+  consecutive readings under 3.5 V it falls back to 5-minute wake cycles.
+- If MQTT stays down for 3 minutes, it power-cycles the modem and retries 30 s
+  later.
+- No OTA runs while in emergency mode.
 
 ---
 
@@ -209,7 +264,7 @@ the one that ships it. Keep this in mind when you check whether such a fix worke
 
 - `arduino-cli` with the **esp32 core 3.x** (tested with 3.3.7). Its bootloader has
   `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y`.
-- Libraries: **TinyGSM**, **PubSubClient**, **ArduinoHttpClient**.
+- Libraries: **TinyGSM**, **PubSubClient**, **ArduinoHttpClient**, **ArduinoJson** (7.x).
 - SSH access (key-based) to the server.
 - Copy `tools/secrets.env.example` to `tools/secrets.env` and fill it in.
   `deploy_ota.sh` generates the gitignored `phase3-ota/secrets.h` from it on every
