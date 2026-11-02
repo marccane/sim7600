@@ -372,5 +372,8 @@ physically:
 | MQTT password compiled into the image | Anyone holding an image can impersonate that device | Per-device credentials stored in NVS / flash encryption, not in the shared image |
 | Unguessable download path | Security by obscurity only | Authenticated downloads (e.g. a signed short-lived URL) |
 
-Also remove the bench-only settings before deployment: `DEBUG_NO_SLEEP` and
-`BENCH_TEST_INTERVAL_S` in `phase3-ota.ino`.
+Also keep the bench-only switches commented out in a deployed build:
+`DEBUG_NO_SLEEP` and `BENCH_TEST_INTERVAL_S` in `phase3-ota.ino`. The first
+build with deep sleep enabled is worth shipping once with a short interval
+(`BENCH_TEST_INTERVAL_S` still set): a build that sleeps and never wakes has
+already confirmed itself, so no rollback can rescue it.

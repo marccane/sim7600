@@ -59,14 +59,13 @@ uint32_t reportIntervalS = 1800;   // production value; bench tests override bel
 #define OTA_MIN_BATT_V    3.60     // don't start a download on a weak cell
 #define WDT_TIMEOUT_MS    180000   // longest single blocking step is ~75 s (TCP connect)
 #define MODEM_OFF_SETTLE_MS 15000 // after CPOF, before a reboot that powers it on again
-#define FW_VERSION        "0.3.3"
+#define FW_VERSION        "0.4.0"
 
-// Bench test override: 90s cycles. MUST be removed before deployment.
-#define BENCH_TEST_INTERVAL_S 90
-
-// DEBUG: never enter deep sleep (board stays awake, serial stays usable).
-// Remove before deployment!
-#define DEBUG_NO_SLEEP
+// Bench-only switches — keep both commented out in a deployed build.
+// 90 s cycles instead of reportIntervalS:
+// #define BENCH_TEST_INTERVAL_S 90
+// Never deep sleep: idle, then restart (board stays awake, USB serial usable):
+// #define DEBUG_NO_SLEEP
 
 HardwareSerial modemSerial(1);
 TinyGsm        modem(modemSerial);
@@ -639,10 +638,13 @@ void setup() {
 
         // Self-update only from a deployed build, after a successful publish
         // (so a broken network path can't strand us mid-download).
-        if (published && strcmp(FW_BUILD, "dev") != 0 &&
-            (onUsb || battV >= OTA_MIN_BATT_V)) {
-          wdtFeed();
-          otaReady = otaCheck();
+        if (published && strcmp(FW_BUILD, "dev") != 0) {
+          if (onUsb || battV >= OTA_MIN_BATT_V) {
+            wdtFeed();
+            otaReady = otaCheck();
+          } else {
+            logf("[OTA] skipped: battery %.2f V < %.2f V", battV, OTA_MIN_BATT_V);
+          }
         }
       } else {
         logln("[NET] GPRS failed");
